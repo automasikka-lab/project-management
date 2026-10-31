@@ -21,33 +21,6 @@ try {
     $hasVerified = false;
 }
 
-// Per-item status untuk assessment Procurement. Kolom ini dibuat/di-upgrade otomatis bila belum sesuai.
-// Status lama 'Pending Vendor' diganti menjadi 'Vendor' (migrasi otomatis, lihat cabang elseif di bawah).
-$procStatusEnum = "'Pending PR','Pending PO','Unapproved PR','Unapproved PO','PR Approved','PO Approved','Vendor','Received'";
-$procStatusEnumMigrasi = "'Pending PR','Pending PO','Unapproved PR','Unapproved PO','PR Approved','PO Approved','Pending Vendor','Vendor','Received'";
-$hasProcStatus = false;
-try {
-    $colCheckProc = $pdo->query("SHOW COLUMNS FROM project_activities LIKE 'procurement_status'")->fetch();
-    if (!$colCheckProc) {
-        $pdo->exec("ALTER TABLE `project_activities` ADD COLUMN `procurement_status` ENUM({$procStatusEnum}) DEFAULT NULL AFTER `po_number`");
-    } else {
-        $procColType = (string)($colCheckProc['Type'] ?? '');
-        if (stripos($procColType, 'enum') !== 0) {
-            $pdo->exec("ALTER TABLE `project_activities` MODIFY COLUMN `procurement_status` ENUM({$procStatusEnum}) DEFAULT NULL AFTER `po_number`");
-        } elseif (stripos($procColType, "'Vendor'") === false) {
-            // Upgrade enum 'Pending Vendor' -> 'Vendor':
-            // 1) sisipkan 'Vendor' tanpa membuang nilai lama (data existing aman),
-            // 2) konversi baris lama, 3) buang 'Pending Vendor' dari daftar enum.
-            $pdo->exec("ALTER TABLE `project_activities` MODIFY COLUMN `procurement_status` ENUM({$procStatusEnumMigrasi}) DEFAULT NULL AFTER `po_number`");
-            $pdo->exec("UPDATE `project_activities` SET `procurement_status` = 'Vendor' WHERE `procurement_status` = 'Pending Vendor'");
-            $pdo->exec("ALTER TABLE `project_activities` MODIFY COLUMN `procurement_status` ENUM({$procStatusEnum}) DEFAULT NULL AFTER `po_number`");
-        }
-    }
-    $hasProcStatus = true;
-} catch (Exception $e) {
-    $hasProcStatus = false;
-}
-
 $activities = qRows($pdo, "SELECT pa.*, COALESCE(rm.name, 'Unassigned') as timeline_name FROM project_activities pa LEFT JOIN ref_milestone rm ON pa.milestone_id = rm.id WHERE pa.project_id = :id ORDER BY COALESCE(rm.sort_order, 999) ASC, pa.row_order ASC, pa.date ASC", [':id' => $id]);
 $planningRows = qRows($pdo, "SELECT ptl.*, rm.id AS planning_milestone_id, rm.name AS planning_milestone_name FROM project_planning_timeline ptl LEFT JOIN ref_milestone rm ON rm.name = ptl.milestone WHERE ptl.project_id = :id ORDER BY ptl.row_order ASC", [':id' => $id]);
 $mirroredPlanning = [];
@@ -85,50 +58,27 @@ $allPics = array_unique(array_filter(array_map(fn($a) => trim($a['pic'] ?? ''), 
 $allPicsStr = $allPics ? implode(', ', $allPics) : '';
 $costBreakdown = qRows($pdo, "SELECT * FROM cost_breakdown WHERE project_id = :id ORDER BY row_order ASC", [':id' => $id]);
 $swot = qOne($pdo, "SELECT problem_overview, existing_condition, expected_condition, gap, action_plan, action_taken, strengths, weaknesses, opportunities, threats FROM projects WHERE id = :id", [':id' => $id]);
-
-// Pastikan kolom link_type ada (bila database belum kena migration.sql).
-$linkTypeColCheck = qRows($pdo, "SHOW COLUMNS FROM `project_drive_links` LIKE 'link_type'");
-if (empty($linkTypeColCheck)) {
-    $pdo->exec("ALTER TABLE `project_drive_links` ADD COLUMN `link_type` VARCHAR(20) NOT NULL DEFAULT 'proposal' AFTER `label`");
-}
-
-// Short Proposal: link_type = 'proposal'; Project Order: link_type = 'project_order'.
-$driveLinks = qRows($pdo, "SELECT id, drive_url, label FROM project_drive_links WHERE project_id = :id AND link_type = 'proposal' ORDER BY id ASC", [':id' => $id]);
-$orderLinks = qRows($pdo, "SELECT id, drive_url, label FROM project_drive_links WHERE project_id = :id AND link_type = 'project_order' ORDER BY id ASC", [':id' => $id]);
+$driveLinks = qRows($pdo, "SELECT id, drive_url, label FROM project_drive_links WHERE project_id = :id ORDER BY id ASC", [':id' => $id]);
 $developmentAnalysis = qRows($pdo, "SELECT problem_overview, existing_condition, expected_condition, gap, action FROM project_development_analysis WHERE project_id = :id ORDER BY row_order ASC", [':id' => $id]);
 $actionAnalysis = qRows($pdo, "SELECT action, strengths, weaknesses, opportunities, threats FROM project_action_analysis WHERE project_id = :id ORDER BY row_order ASC", [':id' => $id]);
 
+// Project order document link for the Project Analyze assessment panel.
+// Short Proposal status comes from project_drive_links ($driveLinks above).
+$hasDocLinks = false;
+try {
+    $colCheckDoc = $pdo->query("SHOW COLUMNS FROM `projects` LIKE 'project_order_link'")->fetch();
+    $hasDocLinks = !empty($colCheckDoc);
+} catch (Exception $e) {
+    $hasDocLinks = false;
+}
+$projectOrderLink = '';
+if ($hasDocLinks) {
+    $projectOrderLink = trim((string)qVal($pdo, "SELECT project_order_link FROM projects WHERE id = :id", [':id' => $id]));
+}
 $hasProposalLink = !empty($driveLinks);
-$hasOrderLink = !empty($orderLinks);
 $rankingSet = !empty($project['ranking']);
 $hasPhoto = !empty($project['image_path']);
 $targetSet = (int)($project['target_unit'] ?? 0) > 0;
-
-// Budgeting — Assessment: kolom SAVINGS PERCENTAGE (per item + baris TOTAL) harus terisi semua.
-$budgetTotalPlanned = 0.0;
-$budgetTotalActual = 0.0;
-$budgetHasPlanned = false;
-$budgetHasActual = false;
-$budgetAllItemsSavings = count($costBreakdown) > 0;
-foreach ($costBreakdown as $cb) {
-    if ($cb['planned_cost'] !== null) {
-        $budgetTotalPlanned += (float)$cb['planned_cost'];
-        $budgetHasPlanned = true;
-    }
-    if ($cb['actual_cost'] !== null) {
-        $budgetTotalActual += (float)$cb['actual_cost'];
-        $budgetHasActual = true;
-    }
-    $rowPlanned = $cb['planned_cost'] !== null ? (float)$cb['planned_cost'] : 0.0;
-    $rowActual = $cb['actual_cost'] !== null ? (float)$cb['actual_cost'] : null;
-    if ($rowPlanned <= 0 || $rowActual === null) {
-        $budgetAllItemsSavings = false;
-    }
-}
-$budgetTotalSavings = ($budgetHasPlanned && $budgetHasActual && $budgetTotalPlanned > 0)
-    ? (($budgetTotalPlanned - $budgetTotalActual) / $budgetTotalPlanned) * 100
-    : null;
-$budgetSavingsComplete = $budgetAllItemsSavings && $budgetTotalSavings !== null;
 
 if (!function_exists('assessmentIcon')) {
     function assessmentIcon($filled) {
@@ -197,84 +147,6 @@ $milestones = [
     ['id' => 10, 'key' => 'Launching', 'icon' => 'bi-rocket-takeoff', 'color' => 'red'],
 ];
 
-// Status item procurement + warna badge-nya
-$procStatusList = ['Pending PR', 'Pending PO', 'Unapproved PR', 'Unapproved PO', 'PR Approved', 'PO Approved', 'Vendor', 'Received'];
-$procStatusColors = [
-    'Pending PR'    => ['bg' => 'bg-amber-100',  'text' => 'text-amber-700',  'icon' => 'bi-hourglass-split'],
-    'Pending PO'    => ['bg' => 'bg-amber-100',  'text' => 'text-amber-700',  'icon' => 'bi-hourglass-split'],
-    'Unapproved PR' => ['bg' => 'bg-red-100',    'text' => 'text-red-700',    'icon' => 'bi-x-octagon'],
-    'Unapproved PO' => ['bg' => 'bg-red-100',    'text' => 'text-red-700',    'icon' => 'bi-x-octagon'],
-    'PR Approved'   => ['bg' => 'bg-blue-100',   'text' => 'text-blue-700',   'icon' => 'bi-check2-circle'],
-    'PO Approved'   => ['bg' => 'bg-blue-100',   'text' => 'text-blue-700',   'icon' => 'bi-check2-circle'],
-    'Vendor'        => ['bg' => 'bg-violet-100', 'text' => 'text-violet-700', 'icon' => 'bi-truck'],
-    'Pending Vendor'=> ['bg' => 'bg-violet-100', 'text' => 'text-violet-700', 'icon' => 'bi-truck'], // fallback data lama (sudah dimigrasi ke 'Vendor')
-    'Received'      => ['bg' => 'bg-emerald-100','text' => 'text-emerald-700','icon' => 'bi-box-seam'],
-];
-
-if (!function_exists('procurementStatusBadge')) {
-    function procurementStatusBadge($status) {
-        global $procStatusColors;
-        $status = trim((string)$status);
-        if ($status === '') {
-            return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold bg-slate-100 text-slate-400">-</span>';
-        }
-        $c = $procStatusColors[$status] ?? ['bg' => 'bg-slate-100', 'text' => 'text-slate-600', 'icon' => 'bi-circle'];
-        return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold ' . $c['bg'] . ' ' . $c['text'] . '"><i class="bi ' . $c['icon'] . '"></i>' . htmlspecialchars($status) . '</span>';
-    }
-}
-if (!function_exists('procurementDeliveryBadge')) {
-    function procurementDeliveryBadge($status) {
-        if (trim((string)$status) === 'Received') {
-            return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold bg-emerald-100 text-emerald-700"><i class="bi bi-check-lg"></i>Received</span>';
-        }
-        return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold bg-red-100 text-red-600"><i class="bi bi-x-lg"></i>Not Received</span>';
-    }
-}
-
-// Baris tabel assessment Procurement = ITEM di card Budgeting — Assessment (cost_breakdown),
-// sehingga jumlah & urutan barisnya PERSIS sama dengan Budgeting.
-// Status/PR tetap dari activity milestone Procurement (id 5) pada urutan yang sama;
-// bila belum ada activity untuk baris itu, barisnya tetap tampil dan activity dibuat
-// saat pertama kali disimpan lewat tombol Update.
-$procActs = [];
-foreach ($activities as $procAct) {
-    if ((int)($procAct['milestone_id'] ?? 0) === 5 && (int)($procAct['id'] ?? 0) > 0) {
-        $procActs[] = $procAct;
-    }
-}
-$procItems = [];
-if (count($costBreakdown) > 0) {
-    for ($pi = 0; $pi < count($costBreakdown); $pi++) {
-        $act = $procActs[$pi] ?? null;
-        $row = $act ?? [
-            'id' => 0, 'project_id' => (int)$id, 'milestone_id' => 5,
-            'timeline' => '', 'pr_number' => '', 'po_number' => '',
-            'procurement_status' => '', 'pic' => '', 'date' => '', 'remarks' => '',
-        ];
-        $row['display_item'] = trim((string)($costBreakdown[$pi]['item_description'] ?? ''));
-        if ($row['display_item'] === '') {
-            $row['display_item'] = trim((string)($row['timeline'] ?? ''));
-        }
-        $procItems[] = $row;
-    }
-} else {
-    // Budget belum punya item — tampilkan activity Procurement apa adanya.
-    foreach ($procActs as $act) {
-        $act['display_item'] = trim((string)($act['timeline'] ?? ''));
-        $procItems[] = $act;
-    }
-}
-
-// Procurement — Item Status: kolom DELIVERY STATUS (Received / Not Received).
-$procTotalItems = count($procItems);
-$procReceivedItems = 0;
-foreach ($procItems as $proc) {
-    if (trim((string)($proc['procurement_status'] ?? '')) === 'Received') {
-        $procReceivedItems++;
-    }
-}
-$procAllReceived = $procTotalItems > 0 && $procReceivedItems === $procTotalItems;
-
 $milestoneCount = [];
 $milestoneVerified = [];
 foreach ($milestones as $m) {
@@ -288,12 +160,6 @@ foreach ($activities as $act) {
         $milestoneVerified[$mid]['total']++;
         if (!empty($act['verified'])) $milestoneVerified[$mid]['verified']++;
     }
-}
-// Semua activity = isi kolom VERIFY pada card "Timeline Desain — Assessment".
-$totalAllActivities = count($activities);
-$verifiedAllActivities = 0;
-foreach ($activities as $act) {
-    if (!empty($act['verified'])) $verifiedAllActivities++;
 }
 $endDateComputed = $project['end_date'] ?? null;
 $durasiHari = qVal($pdo, "SELECT SUM(DATEDIFF(pa.verified_date, pa.date)) FROM project_activities pa WHERE pa.project_id = :pid AND pa.verified = 1 AND pa.verified_date IS NOT NULL AND pa.date IS NOT NULL", [':pid' => $id]);
@@ -309,15 +175,9 @@ if ($durasiActual !== null && $durasiEst !== null) {
 ?>
 <?php if (isset($_GET['msdebug'])): ?>
 <div style="margin:1rem 0;padding:.75rem 1rem;background:#0f172a;color:#4ade80;font:12px/1.6 monospace;border-radius:10px;word-break:break-all;">
-<b>MODUL project_detail.php v3 AKTIF</b> — baris "Project Photos/Videos" SUDAH DIHAPUS dari card Project Desain — Assessment.<br>
+<b>MODUL api/project_detail.php v3 AKTIF</b> — baris "Project Photos/Videos" SUDAH DIHAPUS dari card Project Desain — Assessment.<br>
 File: <?= safe(__FILE__) ?><br>
-Last modified: <?= date('Y-m-d H:i:s', filemtime(__FILE__)) ?> | PHP <?= PHP_VERSION ?><br>
-<?php
-$dbgEmail = (string)($_SESSION['admin_email'] ?? '');
-$dbgName  = (string)($_SESSION['admin_name'] ?? '');
-?>
-LOGIN: <?= $isAdmin ? 'ADMIN' : 'TAMU (belum login)' ?> | email="<?= safe($dbgEmail) ?>" | name="<?= safe($dbgName) ?>" | akses: <?= $canWrite ? 'CRUD' : 'Read Only' ?><br>
-SWOT Analysis &amp; Problem Solving: TANPA pembatasan akun (tampil untuk semua admin &amp; tamu), muncul saat milestone Project Analyze diklik | Edit: <?= $canWrite ? 'YA' : 'TIDAK (Read Only / belum login)' ?>
+Last modified: <?= date('Y-m-d H:i:s', filemtime(__FILE__)) ?> | PHP <?= PHP_VERSION ?>
 </div>
 <?php endif; ?>
 
@@ -361,7 +221,7 @@ SWOT Analysis &amp; Problem Solving: TANPA pembatasan akun (tampil untuk semua a
         <button onclick="openEditProjectModal()" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-blue-500 rounded-lg" title="Edit Project"><i class="bi bi-pencil-square"></i> Edit</button>
         <button onclick="deleteProject()" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-red-500 rounded-lg" title="Delete Project"><i class="bi bi-trash"></i> Hapus</button>
         <?php endif; ?>
-        <button onclick="openDriveLinksModal(true, 'proposal')" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-emerald-500 hover:bg-emerald-600 rounded-lg transition" title="Download Short Proposal"><i class="bi bi-download"></i> Short Proposal</button>
+        <button onclick="openDriveLinksModal(true)" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-emerald-500 hover:bg-emerald-600 rounded-lg transition" title="Download Short Proposal"><i class="bi bi-download"></i> Short Proposal</button>
         <div class="text-right text-xs text-slate-400 ml-2">
             <div>ID: #<?= $project['id'] ?></div>
             <div>Created: <?= safe($project['created_at']) ?: '-' ?></div>
@@ -377,41 +237,10 @@ SWOT Analysis &amp; Problem Solving: TANPA pembatasan akun (tampil untuk semua a
                 $count = $milestoneCount[$m['id']];
                 $verified = $milestoneVerified[$m['id']]['verified'];
                 $total = $milestoneVerified[$m['id']]['total'];
-                if ((int)$m['id'] === 1) {
-                    // Milestone Project Analyze ditentukan oleh Document Assessment:
-                    // kedua dokumen centang -> centang; salah satu silang -> silang.
-                    $hasActivities = true;
-                    $allVerified = $hasProposalLink && $hasOrderLink;
-                } elseif ((int)$m['id'] === 2) {
-                    // Milestone Project Desain ditentukan oleh Assessment Project Desain:
-                    // Ranking + Machine Target centang -> centang; salah satu silang -> silang.
-                    $hasActivities = true;
-                    $allVerified = $rankingSet && $targetSet;
-                } elseif ((int)$m['id'] === 3) {
-                    // Milestone Timeline Desain ditentukan oleh kolom VERIFY pada card
-                    // "Timeline Desain — Assessment" (semua baris activity):
-                    // semua centang -> centang; ada satu pun yang silang -> silang;
-                    // belum ada timeline sama sekali -> abu-abu (No timeline yet).
-                    $hasActivities = $totalAllActivities > 0;
-                    $allVerified = $totalAllActivities > 0 && $verifiedAllActivities === $totalAllActivities;
-                } elseif ((int)$m['id'] === 4) {
-                    // Milestone Budgeting ditentukan oleh kolom SAVINGS PERCENTAGE pada card
-                    // "Budgeting — Assessment" (semua item + baris TOTAL harus ada persentase %);
-                    // ada satu pun yang strip (-) -> silang; belum ada item -> abu-abu.
-                    $hasActivities = count($costBreakdown) > 0;
-                    $allVerified = $budgetSavingsComplete;
-                } elseif ((int)$m['id'] === 5) {
-                    // Milestone Procurement ditentukan oleh kolom DELIVERY STATUS pada card
-                    // "Procurement — Item Status": semua Received -> centang;
-                    // ada satu pun Not Received -> silang; belum ada item -> abu-abu.
-                    $hasActivities = $procTotalItems > 0;
-                    $allVerified = $procAllReceived;
-                } else {
-                    $allVerified = $total > 0 && $verified === $total;
-                    $hasActivities = $count > 0;
-                }
+                $allVerified = $total > 0 && $verified === $total;
+                $hasActivities = $count > 0;
             ?>
-            <button onclick="filterTimeline(<?= (int)$m['id'] ?>)" data-ms="<?= (int)$m['id'] ?>" data-ms-label="<?= safe($m['key']) ?>" class="ms-step flex items-center gap-1.5 px-3 py-2 rounded-lg text-[11px] font-semibold transition-all whitespace-nowrap <?= $allVerified ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : ($hasActivities ? 'bg-red-50 text-red-700 border border-red-200' : 'bg-slate-50 text-slate-400 border border-slate-200 hover:bg-slate-100') ?>">
+            <button onclick="filterTimeline(<?= (int)$m['id'] ?>)" data-ms="<?= (int)$m['id'] ?>" class="ms-step flex items-center gap-1.5 px-3 py-2 rounded-lg text-[11px] font-semibold transition-all whitespace-nowrap <?= $allVerified ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : ($hasActivities ? 'bg-red-50 text-red-700 border border-red-200' : 'bg-slate-50 text-slate-400 border border-slate-200 hover:bg-slate-100') ?>">
                 <?php if ($allVerified): ?><i class="bi bi-check-circle-fill text-emerald-500"></i><?php elseif ($hasActivities): ?><i class="bi bi-x-circle-fill text-red-500"></i><?php else: ?><i class="bi <?= $m['icon'] ?>"></i><?php endif; ?>
                 <?= $m['key'] ?>
             </button>
@@ -465,7 +294,7 @@ SWOT Analysis &amp; Problem Solving: TANPA pembatasan akun (tampil untuk semua a
                 <tr class="hover:bg-slate-50">
                     <td class="px-3 py-2 border border-slate-300 text-slate-600 align-top">Project Order Document</td>
                     <td id="docStatus-project_order_link" class="px-3 py-2 border border-slate-300 align-top text-center">
-                        <?php if ($hasOrderLink): ?>
+                        <?php if ($projectOrderLink !== ''): ?>
                         <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-emerald-100 text-emerald-600" title="Link sudah diisi"><i class="bi bi-check-lg"></i></span>
                         <?php else: ?>
                         <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-red-100 text-red-500" title="Link belum diisi"><i class="bi bi-x-lg"></i></span>
@@ -473,7 +302,7 @@ SWOT Analysis &amp; Problem Solving: TANPA pembatasan akun (tampil untuk semua a
                     </td>
                     <td class="px-3 py-2 border border-slate-300 align-top">
                         <div class="flex items-center gap-2 flex-wrap">
-                            <button onclick="openOrderLinkModal()" class="inline-flex items-center gap-1 px-3 py-1.5 text-[11px] font-semibold text-white bg-blue-500 hover:bg-blue-600 rounded-lg transition"><i class="bi bi-pencil-square"></i>Update</button>
+                            <button onclick="openDocLinkModal('project_order_link','Project Order Document')" class="inline-flex items-center gap-1 px-3 py-1.5 text-[11px] font-semibold text-white bg-blue-500 hover:bg-blue-600 rounded-lg transition"><i class="bi bi-pencil-square"></i>Update</button>
                             <button onclick="downloadProjectOrderDocument()" class="inline-flex items-center gap-1 px-3 py-1.5 text-[11px] font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition"><i class="bi bi-download"></i>Download</button>
                         </div>
                     </td>
@@ -666,67 +495,55 @@ SWOT Analysis &amp; Problem Solving: TANPA pembatasan akun (tampil untuk semua a
 
 <!-- Budgeting Assessment -->
 <div id="budgetAssessment" class="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden mb-6 hidden">
-    <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
-        <div class="flex items-center gap-2">
-            <i class="bi bi-cash-stack text-cyan-500"></i>
-            <span class="text-sm font-bold text-slate-700">Budgeting &mdash; Assessment</span>
-        </div>
-        <?php if ($canWrite): ?>
-        <button onclick="openCbModal()" class="inline-flex items-center gap-1 px-3 py-1.5 text-[11px] font-semibold text-white bg-blue-500 hover:bg-blue-600 rounded-lg transition"><i class="bi bi-plus-lg"></i> Add Item</button>
-        <?php endif; ?>
+    <div class="px-5 py-4 border-b border-slate-100 flex items-center gap-2">
+        <i class="bi bi-cash-stack text-cyan-500"></i>
+        <span class="text-sm font-bold text-slate-700">Budgeting &mdash; Assessment</span>
     </div>
     <div class="p-5 overflow-x-auto">
-        <?php if (count($costBreakdown) > 0): ?>
-        <table class="w-full text-xs border border-slate-300" style="min-width:1160px;">
+        <?php if (count($activities) > 0): ?>
+        <table class="w-full text-xs border border-slate-300" style="min-width:920px;">
             <thead>
                 <tr class="bg-slate-100">
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-center" style="width:45px;">NO</th>
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-left">ITEM</th>
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-right" style="width:100px;">PLANNED UNIT</th>
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-right" style="width:110px;">EXPENDITURE UNIT</th>
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-left" style="width:80px;">UNIT</th>
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-right" style="width:120px;">PLANNED PRICE</th>
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-right" style="width:130px;">EXPENDITURE PRICE</th>
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-right" style="width:130px;">PLANNED COST</th>
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-right" style="width:130px;">EXPENDITURE</th>
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-right" style="width:110px;">SAVINGS PERCENTAGE</th>
+                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-left" style="width:45px;">NO</th>
+                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-left">TIMELINE</th>
+                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-left">MILESTONE</th>
+                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-left">REMARK</th>
+                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-left" style="width:110px;">EST. DURATION</th>
+                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-left" style="width:100px;">START</th>
+                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-left" style="width:100px;">END</th>
+                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-center" style="width:150px;">VERIFY</th>
                     <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-center" style="width:90px;">UPDATE</th>
                 </tr>
             </thead>
             <tbody>
-                <?php foreach ($costBreakdown as $i => $cb):
-                    $rowPlannedCost = $cb['planned_cost'] !== null ? (float)$cb['planned_cost'] : null;
-                    $rowActualCost = $cb['actual_cost'] !== null ? (float)$cb['actual_cost'] : null;
-                    $rowSavings = null;
-                    if ($rowPlannedCost !== null && $rowPlannedCost > 0 && $rowActualCost !== null) {
-                        $rowSavings = (($rowPlannedCost - $rowActualCost) / $rowPlannedCost) * 100;
-                    }
-                ?>
+                <?php foreach ($activities as $i => $act): ?>
                 <tr class="hover:bg-slate-50">
-                    <td class="px-3 py-2 border border-slate-300 text-slate-600 text-center align-top"><?= $i + 1 ?>.</td>
-                    <td class="px-3 py-2 border border-slate-300 text-slate-700 align-top"><?= safe($cb['item_description']) ?: '-' ?></td>
-                    <td class="px-3 py-2 border border-slate-300 text-slate-600 text-right align-top"><?= $cb['planned_quantity'] !== null ? (int)$cb['planned_quantity'] : '-' ?></td>
-                    <td class="px-3 py-2 border border-slate-300 text-slate-600 text-right align-top"><?= $cb['actual_quantity'] !== null ? (int)$cb['actual_quantity'] : '-' ?></td>
-                    <td class="px-3 py-2 border border-slate-300 text-slate-600 text-left align-top"><?= safe($cb['unit'] ?? '') ?: '-' ?></td>
-                    <td class="px-3 py-2 border border-slate-300 text-slate-600 text-right align-top"><?= formatRupiah($cb['planned_price']) ?></td>
-                    <td class="px-3 py-2 border border-slate-300 text-slate-600 text-right align-top"><?= formatRupiah($cb['actual_price']) ?></td>
-                    <td class="px-3 py-2 border border-slate-300 text-slate-700 font-medium text-right align-top"><?= formatRupiah($cb['planned_cost']) ?></td>
-                    <td class="px-3 py-2 border border-slate-300 text-slate-700 font-medium text-right align-top"><?= formatRupiah($cb['actual_cost']) ?></td>
-                    <td class="px-3 py-2 border border-slate-300 text-right align-top font-semibold <?= $rowSavings === null ? 'text-slate-400' : ($rowSavings >= 0 ? 'text-emerald-600' : 'text-red-600') ?>">
-                        <?= $rowSavings === null ? '-' : (str_replace('.', ',', number_format($rowSavings, 1)) . '%') ?>
+                    <td class="px-3 py-2 border border-slate-300 text-slate-600 align-top"><?= $i + 1 ?>.</td>
+                    <td class="px-3 py-2 border border-slate-300 text-slate-600 align-top"><?= safe($act['timeline'] ?: '-') ?></td>
+                    <td class="px-3 py-2 border border-slate-300 align-top"><span class="inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-semibold bg-slate-100 text-slate-600"><?= safe($act['timeline_name'] ?: '-') ?></span></td>
+                    <td class="px-3 py-2 border border-slate-300 text-[10px] text-slate-600 whitespace-pre-line break-words align-top" title="<?= safe($act['remarks'] ?: '') ?>"><?= safe($act['remarks'] ?: '-') ?></td>
+                    <td class="px-3 py-2 border border-slate-300 text-slate-600 align-top"><?= $act['estimated_duration'] !== null ? (int)$act['estimated_duration'] . ' hari' : '-' ?></td>
+                    <td class="px-3 py-2 border border-slate-300 text-slate-600 align-top"><?= fmtDate($act['date'] ?? null) ?></td>
+                    <td class="px-3 py-2 border border-slate-300 text-slate-600 align-top"><?= fmtDate($act['verified_date'] ?? null) ?></td>
+                    <td class="px-3 py-2 border border-slate-300 align-top text-center">
+                        <div class="flex items-center justify-center gap-2">
+                            <?php if (!empty($act['verified'])): ?>
+                            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-emerald-100 text-emerald-600" title="Verified"><i class="bi bi-check-lg"></i></span>
+                            <?php else: ?>
+                            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-red-100 text-red-500" title="Unverified"><i class="bi bi-x-lg"></i></span>
+                            <?php if ($canWrite && (int)($act['id'] ?? 0) > 0): ?>
+                            <button onclick="verifyTimeline(<?= (int)$act['id'] ?>, '<?= safe(addslashes($act['timeline_name'] ?? '')) ?>')" class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-white bg-blue-500 hover:bg-blue-600 rounded-lg transition" title="Verify">
+                                <i class="bi bi-check-lg"></i> Verify
+                            </button>
+                            <?php endif; ?>
+                            <?php endif; ?>
+                        </div>
                     </td>
-                    <td class="px-3 py-2 border border-slate-300 text-center align-top">
-                        <?php if ($canWrite): ?>
-                        <button onclick="editCbItem(this)" class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-white bg-blue-500 hover:bg-blue-600 rounded-lg transition" title="Update item"
-                            data-id="<?= (int)$cb['id'] ?>"
-                            data-item="<?= htmlspecialchars($cb['item_description']) ?>"
-                            data-unit="<?= htmlspecialchars($cb['unit'] ?? '') ?>"
-                            data-pp="<?= $cb['planned_price'] ?? '' ?>"
-                            data-pq="<?= $cb['planned_quantity'] ?? '' ?>"
-                            data-aq="<?= $cb['actual_quantity'] ?? '' ?>"
-                            data-ap="<?= $cb['actual_price'] ?? '' ?>">
+                    <td class="px-3 py-2 border border-slate-300 align-top text-center">
+                        <?php if ($canWrite && (int)($act['id'] ?? 0) > 0): ?>
+                        <button onclick="openEditTimeline(<?= (int)$act['id'] ?>, '<?= safe(addslashes($act['timeline'] ?? '')) ?>', '<?= safe(addslashes($act['pic'] ?? '')) ?>', '<?= safe(addslashes($act['pr_number'] ?? '')) ?>', '<?= safe(addslashes($act['po_number'] ?? '')) ?>', '<?= safe(addslashes($act['remarks'] ?? '')) ?>', '<?= safe($act['date'] ?? '') ?>', <?= (int)($act['estimated_duration'] ?? 0) ?>, <?= (int)$act['milestone_id'] ?>)" class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-white bg-blue-500 hover:bg-blue-600 rounded-lg transition" title="Edit">
                             <i class="bi bi-pencil-square"></i> Update
-                        </button>
+                            </button>
                         <?php else: ?>
                         <span class="text-slate-300">-</span>
                         <?php endif; ?>
@@ -734,162 +551,10 @@ SWOT Analysis &amp; Problem Solving: TANPA pembatasan akun (tampil untuk semua a
                 </tr>
                 <?php endforeach; ?>
             </tbody>
-            <tfoot>
-                <tr class="bg-slate-100">
-                    <td colspan="7" class="px-3 py-2 border border-slate-300 text-right font-bold text-slate-700">TOTAL</td>
-                    <td class="px-3 py-2 border border-slate-300 text-right font-bold text-slate-700">
-                        <span class="block text-[9px] font-semibold text-slate-400">(TOTAL_PLANNED_COST)</span>
-                        <?= formatRupiah($budgetHasPlanned ? $budgetTotalPlanned : null) ?>
-                    </td>
-                    <td class="px-3 py-2 border border-slate-300 text-right font-bold text-slate-700">
-                        <span class="block text-[9px] font-semibold text-slate-400">(TOTAL_EXPENDITURE)</span>
-                        <?= formatRupiah($budgetHasActual ? $budgetTotalActual : null) ?>
-                    </td>
-                    <td class="px-3 py-2 border border-slate-300 text-right align-top font-semibold <?= $budgetTotalSavings === null ? 'text-slate-400' : ($budgetTotalSavings >= 0 ? 'text-emerald-600' : 'text-red-600') ?>">
-                        <?= $budgetTotalSavings === null ? '-' : (str_replace('.', ',', number_format($budgetTotalSavings, 1)) . '%') ?>
-                    </td>
-                    <td class="border border-slate-300"></td>
-                </tr>
-            </tfoot>
         </table>
         <?php else: ?>
-        <div class="p-8 text-center">
-            <i class="bi bi-inbox text-3xl text-slate-300 block mb-2"></i>
-            <p class="text-sm text-slate-400">No budget items yet</p>
-            <?php if ($canWrite): ?>
-            <button onclick="openCbModal()" class="mt-3 inline-flex items-center gap-1 px-3 py-1.5 text-[11px] font-semibold text-white bg-blue-500 hover:bg-blue-600 rounded-lg transition"><i class="bi bi-plus-lg"></i> Add Item</button>
-            <?php endif; ?>
-        </div>
+        <div class="p-8 text-center"><i class="bi bi-inbox text-3xl text-slate-300 block mb-2"></i><p class="text-sm text-slate-400">No timeline yet</p></div>
         <?php endif; ?>
-    </div>
-</div>
-
-<!-- Procurement Assessment -->
-<div id="procurementAssessment" class="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden mb-6 hidden">
-    <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
-        <div class="flex items-center gap-2">
-            <i class="bi bi-cart-check text-teal-500"></i>
-            <span class="text-sm font-bold text-slate-700">Procurement &mdash; Item Status</span>
-            <span class="text-[10px] font-semibold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full"><?= count($procItems) ?> items</span>
-        </div>
-    </div>
-    <div class="p-5 overflow-x-auto">
-        <?php if (count($procItems) > 0): ?>
-        <table class="w-full text-xs border border-slate-300" style="min-width:760px;">
-            <thead>
-                <tr class="bg-slate-100">
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-left" style="width:50px;">NO</th>
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-left">ITEM</th>
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-left" style="width:160px;">STATUS</th>
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-left" style="width:170px;">DELIVERY STATUS</th>
-                    <th class="px-3 py-2 border border-slate-300 font-semibold text-slate-700 text-center" style="width:180px;">ACTION</th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php foreach ($procItems as $i => $proc): ?>
-                <tr class="hover:bg-slate-50" data-proc-idx="<?= $i ?>">
-                    <td class="px-3 py-2 border border-slate-300 text-slate-600 align-top"><?= $i + 1 ?>.</td>
-                    <td class="px-3 py-2 border border-slate-300 text-slate-700 align-top proc-item-cell"><?= safe($proc['display_item'] ?: '-') ?></td>
-                    <td class="px-3 py-2 border border-slate-300 align-top proc-status-cell"><?= procurementStatusBadge($proc['procurement_status'] ?? '') ?></td>
-                    <td class="px-3 py-2 border border-slate-300 align-top proc-delivery-cell"><?= procurementDeliveryBadge($proc['procurement_status'] ?? '') ?></td>
-                    <td class="px-3 py-2 border border-slate-300 text-center align-top">
-                        <div class="flex items-center justify-center gap-2">
-                            <?php if ($canWrite): ?>
-                            <button onclick="openProcUpdate(<?= $i ?>)" class="inline-flex items-center gap-1 px-3 py-1.5 text-[11px] font-semibold text-white bg-blue-500 hover:bg-blue-600 rounded-lg transition"><i class="bi bi-pencil-square"></i>Update</button>
-                            <?php endif; ?>
-                            <button onclick="openProcDetail(<?= $i ?>)" class="inline-flex items-center gap-1 px-3 py-1.5 text-[11px] font-semibold text-slate-600 bg-white hover:bg-slate-50 border border-slate-300 rounded-lg transition"><i class="bi bi-eye"></i>Detail</button>
-                        </div>
-                    </td>
-                </tr>
-                <?php endforeach; ?>
-            </tbody>
-        </table>
-        <?php else: ?>
-        <div class="p-8 text-center"><i class="bi bi-inbox text-3xl text-slate-300 block mb-2"></i><p class="text-sm text-slate-400">No procurement items yet</p></div>
-        <?php endif; ?>
-    </div>
-</div>
-
-<!-- Procurement Update Modal -->
-<div id="procUpdateModal" class="fixed inset-0 z-[9999] hidden">
-    <div class="absolute inset-0 bg-black/50 backdrop-blur-sm" onclick="closeProcUpdate()"></div>
-    <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-md bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden" style="animation:modalSlideIn .2s ease-out both">
-        <form id="procUpdateForm" class="p-5 space-y-4">
-            <input type="hidden" name="project_id" value="<?= (int)$id ?>">
-            <input type="hidden" name="activity_id" id="procActivityId" value="">
-            <input type="hidden" name="row_idx" id="procRowIdx" value="">
-            <div>
-                <label class="block text-xs font-bold text-slate-600 mb-1">Item</label>
-                <input type="text" name="item" id="procItemInput" required readonly class="w-full px-3 py-2 text-xs rounded-lg border border-slate-200 bg-slate-50 text-slate-600 outline-none transition" placeholder="e.g. Sensor, Conveyor, Cable...">
-                <p class="text-[10px] text-slate-400 mt-1">Nama item diambil dari Budgeting &mdash; Assessment (diubah di sana).</p>
-            </div>
-            <div>
-                <label class="block text-xs font-bold text-slate-600 mb-1">No PR</label>
-                <input type="text" name="pr_number" id="procPrInput" class="w-full px-3 py-2 text-xs rounded-lg border border-slate-200 focus:border-blue-400 focus:ring-2 focus:ring-blue-100 outline-none transition" placeholder="Optional">
-            </div>
-            <div>
-                <label class="block text-xs font-bold text-slate-600 mb-1">Status</label>
-                <select name="status" id="procStatusSelect" class="w-full px-3 py-2 text-xs rounded-lg border border-slate-200 focus:border-blue-400 focus:ring-2 focus:ring-blue-100 outline-none transition bg-white">
-                    <option value="">- Select status -</option>
-                    <?php foreach ($procStatusList as $ps): ?>
-                    <option value="<?= safe($ps) ?>"><?= safe($ps) ?></option>
-                    <?php endforeach; ?>
-                </select>
-                <p class="text-[10px] text-slate-400 mt-1">Delivery Status mengikuti Status: Received &rarr; Received, selain itu &rarr; Not Received.</p>
-            </div>
-            <div class="flex items-center gap-3 pt-2">
-                <button type="submit" class="px-5 py-2.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl transition"><i class="bi bi-check-lg mr-1"></i>Save</button>
-                <button type="button" onclick="closeProcUpdate()" class="px-5 py-2.5 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition">Cancel</button>
-            </div>
-        </form>
-    </div>
-</div>
-
-<!-- Procurement Detail Modal -->
-<div id="procDetailModal" class="fixed inset-0 z-[9999] hidden">
-    <div class="absolute inset-0 bg-black/50 backdrop-blur-sm" onclick="closeProcDetail()"></div>
-    <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-md bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden" style="animation:modalSlideIn .2s ease-out both">
-        <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
-            <span class="text-sm font-bold text-slate-700"><i class="bi bi-eye mr-1 text-teal-500"></i> Procurement Item Detail</span>
-            <button onclick="closeProcDetail()" class="text-slate-400 hover:text-slate-600"><i class="bi bi-x-lg"></i></button>
-        </div>
-        <div class="p-5 space-y-3">
-            <div>
-                <div class="text-[10px] font-bold uppercase text-slate-400 mb-1">Item</div>
-                <div id="procDetailItem" class="text-xs font-semibold text-slate-700">-</div>
-            </div>
-            <div>
-                <div class="text-[10px] font-bold uppercase text-slate-400 mb-1">No PR</div>
-                <div id="procDetailPr" class="text-xs font-semibold text-slate-700">-</div>
-            </div>
-            <div class="grid grid-cols-2 gap-3">
-                <div>
-                    <div class="text-[10px] font-bold uppercase text-slate-400 mb-1">Status</div>
-                    <div id="procDetailStatus">-</div>
-                </div>
-                <div>
-                    <div class="text-[10px] font-bold uppercase text-slate-400 mb-1">Delivery Status</div>
-                    <div id="procDetailDelivery">-</div>
-                </div>
-            </div>
-            <div class="grid grid-cols-2 gap-3">
-                <div>
-                    <div class="text-[10px] font-bold uppercase text-slate-400 mb-1">PIC</div>
-                    <div id="procDetailPic" class="text-xs font-semibold text-slate-700">-</div>
-                </div>
-                <div>
-                    <div class="text-[10px] font-bold uppercase text-slate-400 mb-1">Start Date</div>
-                    <div id="procDetailDate" class="text-xs font-semibold text-slate-700">-</div>
-                </div>
-            </div>
-            <div>
-                <div class="text-[10px] font-bold uppercase text-slate-400 mb-1">Remark</div>
-                <div id="procDetailRemark" class="text-xs text-slate-600 whitespace-pre-line">-</div>
-            </div>
-            <div class="flex justify-end pt-2">
-                <button onclick="closeProcDetail()" class="px-4 py-2 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition">Close</button>
-            </div>
-        </div>
     </div>
 </div>
 
@@ -1082,100 +747,7 @@ document.getElementById('cbForm').addEventListener('submit',function(e){
         if(d.ok){window.location.reload()}else{alert(d.msg||'Failed')}
     }).catch(function(e){btn.innerHTML=orig;btn.disabled=false;alert('Error: '+e.message)})
 });
-var procForm = document.getElementById('procUpdateForm');
-if (procForm) {
-    procForm.addEventListener('submit', function(e) {
-        e.preventDefault();
-        var btn = procForm.querySelector('button[type="submit"]');
-        var orig = btn.innerHTML;
-        btn.innerHTML = '<i class="bi bi-hourglass-split mr-1"></i>Saving...';
-        btn.disabled = true;
-        var fd = new FormData(procForm);
-        fetch('api/save_procurement_item.php', {method: 'POST', body: fd})
-            .then(function(r) { return r.json(); })
-            .then(function(d) {
-                btn.innerHTML = orig; btn.disabled = false;
-                if (d.ok) { closeProcUpdate(); applyProcItem(d.item); }
-                else { alert(d.msg || 'Failed'); }
-            })
-            .catch(function(err) { btn.innerHTML = orig; btn.disabled = false; alert('Error: ' + err.message); });
-    });
-}
 });
-
-var PROC_STATUS_COLORS = <?= json_encode($procStatusColors) ?>;
-var PROC_ITEMS = <?= json_encode(array_map(fn($p) => [
-    'id' => (int)$p['id'],
-    'item' => (string)($p['display_item'] ?? $p['timeline'] ?? ''),
-    'pr' => (string)($p['pr_number'] ?? ''),
-    'po' => (string)($p['po_number'] ?? ''),
-    'status' => (string)($p['procurement_status'] ?? ''),
-    'pic' => (string)($p['pic'] ?? ''),
-    'date' => (string)($p['date'] ?? ''),
-    'remarks' => (string)($p['remarks'] ?? ''),
-], $procItems)) ?>;
-var PROC_ITEM_INDEX = {};
-PROC_ITEMS.forEach(function(it, i) { PROC_ITEM_INDEX[i] = it; });
-
-function procStatusHtml(status) {
-    status = (status || '').trim();
-    if (!status) return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold bg-slate-100 text-slate-400">-</span>';
-    var c = PROC_STATUS_COLORS[status] || {bg: 'bg-slate-100', text: 'text-slate-600', icon: 'bi-circle'};
-    return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold ' + c.bg + ' ' + c.text + '"><i class="bi ' + c.icon + '"></i>' + escapeHtml(status) + '</span>';
-}
-function procDeliveryHtml(status) {
-    if ((status || '').trim() === 'Received') {
-        return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold bg-emerald-100 text-emerald-700"><i class="bi bi-check-lg"></i>Received</span>';
-    }
-    return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold bg-red-100 text-red-600"><i class="bi bi-x-lg"></i>Not Received</span>';
-}
-function openProcUpdate(idx) {
-    var it = PROC_ITEM_INDEX[idx];
-    if (!it) return;
-    // id = 0 → baris ini belum punya activity, akan dibuat saat disimpan.
-    document.getElementById('procActivityId').value = it.id || 0;
-    document.getElementById('procRowIdx').value = idx;
-    document.getElementById('procItemInput').value = it.item || '';
-    document.getElementById('procPrInput').value = it.pr || '';
-    var sel = document.getElementById('procStatusSelect');
-    sel.value = it.status || '';
-    if (sel.value !== (it.status || '')) sel.value = '';
-    document.getElementById('procUpdateModal').classList.remove('hidden');
-    setTimeout(function() { document.getElementById('procItemInput').focus(); }, 100);
-}
-function closeProcUpdate() {
-    document.getElementById('procUpdateModal').classList.add('hidden');
-}
-function openProcDetail(idx) {
-    var it = PROC_ITEM_INDEX[idx];
-    if (!it) return;
-    document.getElementById('procDetailItem').textContent = it.item || '-';
-    document.getElementById('procDetailPr').textContent = it.pr || '-';
-    document.getElementById('procDetailStatus').innerHTML = procStatusHtml(it.status);
-    document.getElementById('procDetailDelivery').innerHTML = procDeliveryHtml(it.status);
-    document.getElementById('procDetailPic').textContent = it.pic || '-';
-    document.getElementById('procDetailDate').textContent = it.date || '-';
-    document.getElementById('procDetailRemark').textContent = it.remarks || '-';
-    document.getElementById('procDetailModal').classList.remove('hidden');
-}
-function closeProcDetail() {
-    document.getElementById('procDetailModal').classList.add('hidden');
-}
-function applyProcItem(saved) {
-    var idx = parseInt((document.getElementById('procRowIdx') || {}).value, 10);
-    if (isNaN(idx)) return;
-    var it = PROC_ITEM_INDEX[idx];
-    if (!it) return;
-    // Nama item TIDAK ditimpa dari server (kolom ITEM selalu dari Budgeting — Assessment).
-    if (saved.activity_id) it.id = parseInt(saved.activity_id, 10) || it.id;
-    it.pr = saved.pr_number || '';
-    it.status = saved.status || '';
-    var row = document.querySelector('tr[data-proc-idx="' + idx + '"]');
-    if (!row) return;
-    row.querySelector('.proc-status-cell').innerHTML = procStatusHtml(it.status);
-    row.querySelector('.proc-delivery-cell').innerHTML = procDeliveryHtml(it.status);
-}
-
 function filterTimeline(ms) {
     var rows = document.querySelectorAll('.tl-row');
     var count = 0;
@@ -1186,7 +758,7 @@ function filterTimeline(ms) {
             s.classList.add('ring-2', 'ring-blue-400', 'bg-blue-50', 'text-blue-700', 'border-blue-300');
         }
     });
-    var milestoneNames = {1:'Project Analyze',2:'Project Desain',3:'Timeline Desain',4:'Budgeting',5:'Procurement',8:'Development',9:'Trial Evaluation',10:'Launching'};
+    var milestoneNames = {1:'Project Analyze',2:'Project Desain',3:'Timeline Desain',4:'Budgeting',8:'Development',9:'Trial Evaluation',10:'Launching'};
     rows.forEach(function(row) {
         if (!ms || parseInt(row.getAttribute('data-ms')) === ms) {
             row.style.display = '';
@@ -1232,11 +804,6 @@ function filterTimeline(ms) {
     if (budgetPanel) {
         if (ms === 4) budgetPanel.classList.remove('hidden');
         else budgetPanel.classList.add('hidden');
-    }
-    var procurementPanel = document.getElementById('procurementAssessment');
-    if (procurementPanel) {
-        if (ms === 5) procurementPanel.classList.remove('hidden');
-        else procurementPanel.classList.add('hidden');
     }
     // Card Activity Timeline hanya muncul saat milestone Development / Trial Evaluation / Launching diklik
     var timelineCard = document.getElementById('timelineCard');
@@ -2020,33 +1587,15 @@ function toggleImageAction() {
                     </div>
                     <?php endif; ?>
                 </div>
-                <button type="button" onclick="addDriveRow('driveLinkRows')" class="inline-flex items-center gap-1 mt-2 px-3 py-1.5 text-[11px] font-semibold text-blue-600 bg-blue-50 hover:bg-blue-100 rounded-lg transition"><i class="bi bi-plus-lg"></i> Tambah Link</button>
+                <button type="button" onclick="addDriveRow()" class="inline-flex items-center gap-1 mt-2 px-3 py-1.5 text-[11px] font-semibold text-blue-600 bg-blue-50 hover:bg-blue-100 rounded-lg transition"><i class="bi bi-plus-lg"></i> Tambah Link</button>
             </div>
+            <?php if ($hasDocLinks): ?>
             <div class="border-t border-slate-100 pt-3">
-                <label class="block text-xs font-bold text-slate-600 mb-1"><i class="bi bi-file-earmark-word mr-1"></i>Link Google Drive (Project Order Document)</label>
-                <div class="space-y-2" id="orderLinkRows">
-                    <?php if (!empty($orderLinks)): ?>
-                    <?php foreach ($orderLinks as $ol): ?>
-                    <div class="flex items-start gap-2 drive-row">
-                        <div class="flex-1 space-y-1">
-                            <input type="text" class="drive-label w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 focus:border-blue-400 focus:ring-1 focus:ring-blue-100 outline-none transition" placeholder="Label (opsional)" value="<?= safe($ol['label']) ?>">
-                            <input type="url" class="drive-url w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 focus:border-blue-400 focus:ring-1 focus:ring-blue-100 outline-none transition" placeholder="https://drive.google.com/..." value="<?= safe($ol['drive_url']) ?>">
-                        </div>
-                        <button type="button" onclick="removeDriveRow(this)" class="mt-1 w-8 h-8 flex items-center justify-center rounded-lg bg-red-50 text-red-500 hover:bg-red-100 transition flex-shrink-0" title="Hapus"><i class="bi bi-trash text-xs"></i></button>
-                    </div>
-                    <?php endforeach; ?>
-                    <?php else: ?>
-                    <div class="flex items-start gap-2 drive-row">
-                        <div class="flex-1 space-y-1">
-                            <input type="text" class="drive-label w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 focus:border-blue-400 focus:ring-1 focus:ring-blue-100 outline-none transition" placeholder="Label (opsional)">
-                            <input type="url" class="drive-url w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 focus:border-blue-400 focus:ring-1 focus:ring-blue-100 outline-none transition" placeholder="https://drive.google.com/...">
-                        </div>
-                        <button type="button" onclick="removeDriveRow(this)" class="mt-1 w-8 h-8 flex items-center justify-center rounded-lg bg-red-50 text-red-500 hover:bg-red-100 transition flex-shrink-0" title="Hapus"><i class="bi bi-trash text-xs"></i></button>
-                    </div>
-                    <?php endif; ?>
-                </div>
-                <button type="button" onclick="addDriveRow('orderLinkRows')" class="inline-flex items-center gap-1 mt-2 px-3 py-1.5 text-[11px] font-semibold text-blue-600 bg-blue-50 hover:bg-blue-100 rounded-lg transition"><i class="bi bi-plus-lg"></i> Tambah Link</button>
+                <label class="block text-xs font-bold text-slate-600 mb-1"><i class="bi bi-file-earmark-word mr-1"></i>Link Project Order Document</label>
+                <input type="url" name="project_order_link" class="w-full px-2.5 py-2 text-xs rounded-lg border border-slate-200 focus:border-blue-400 focus:ring-1 focus:ring-blue-100 outline-none transition" placeholder="https://drive.google.com/..." value="<?= safe($projectOrderLink) ?>">
+                <p class="text-[10px] text-slate-400 mt-1">Kosongkan bila link belum tersedia.</p>
             </div>
+            <?php endif; ?>
             <div class="flex items-center gap-3 pt-2">
                 <button type="submit" class="px-5 py-2.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl transition"><i class="bi bi-check-lg mr-1"></i>Save</button>
                 <button type="button" onclick="closeEditProjectModal()" class="px-5 py-2.5 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition">Cancel</button>
@@ -2118,9 +1667,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 .then(function(r) { return r.json(); })
                 .then(function(d) {
                     if (d.ok) {
-                        return saveDriveLinks('driveLinkRows', 'proposal')
-                            .then(function() { return saveDriveLinks('orderLinkRows', 'project_order'); })
-                            .then(function() { window.location.reload(); });
+                        return saveDriveLinks('driveLinkRows').then(function() { window.location.reload(); });
                     } else {
                         alert('Failed: ' + (d.msg || 'Unknown error'));
                         btn.innerHTML = origText;
@@ -2136,8 +1683,7 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 });
 
-function saveDriveLinks(scopeId, linkType) {
-    var type = (linkType === 'project_order') ? 'project_order' : 'proposal';
+function saveDriveLinks(scopeId) {
     var scope = document.getElementById(scopeId || 'driveLinkRows') || document;
     var rows = scope.querySelectorAll('.drive-row');
     var urls = [], labels = [];
@@ -2149,24 +1695,21 @@ function saveDriveLinks(scopeId, linkType) {
     var fd = new FormData();
     fd.append('action', 'save');
     fd.append('project_id', '<?= $id ?>');
-    fd.append('link_type', type);
     urls.forEach(function(u, i) { fd.append('urls[]', u); fd.append('labels[]', labels[i]); });
     return fetch('api/drive_links.php', { method: 'POST', body: fd })
         .then(function(r) { return r.json(); })
         .then(function(d) {
             if (d.ok) {
-                LINKS[type] = urls.map(function(u, i) { return { id: 0, drive_url: u, label: labels[i] }; });
+                DRIVE_LINKS = urls.map(function(u, i) { return { id: 0, drive_url: u, label: labels[i] }; });
             }
             return d;
         });
 }
 
 function saveDriveLinksModal() {
-    var type = DRIVE_LINK_TYPE;
-    return saveDriveLinks('driveLinkRowsModal', type).then(function(d) {
+    return saveDriveLinks('driveLinkRowsModal').then(function(d) {
         if (d && d.ok) {
-            renderDocStatus(type, driveLinksFor(type).length > 0);
-            refreshAnalyzeMilestone();
+            renderDocStatus('short_proposal_link', DRIVE_LINKS.length > 0);
             closeDriveLinksModal();
         }
         return d;
@@ -2289,6 +1832,28 @@ document.addEventListener('DOMContentLoaded', function() {
         </div>
     </div>
 </div>
+<!-- Document Link Modal -->
+<div id="docLinkModal" class="fixed inset-0 z-[9999] hidden">
+    <div class="absolute inset-0 bg-black/50" onclick="closeDocLinkModal()"></div>
+    <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-md bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden">
+        <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+            <span class="text-sm font-bold text-slate-700" id="docLinkModalTitle">Update Document Link</span>
+            <button onclick="closeDocLinkModal()" class="text-slate-400 hover:text-slate-600"><i class="bi bi-x-lg"></i></button>
+        </div>
+        <div class="p-5 space-y-4">
+            <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1">Link Document</label>
+                <input type="url" id="docLinkInput" class="w-full px-3 py-2 text-xs rounded-lg border border-slate-200 focus:border-blue-400 focus:ring-2 focus:ring-blue-100 outline-none transition" placeholder="https://drive.google.com/..." onkeydown="if(event.key==='Enter'){event.preventDefault();saveDocLink();}">
+                <p class="text-[10px] text-slate-400 mt-1">Kosongkan untuk menghapus link (status jadi silang).</p>
+            </div>
+            <div class="flex justify-end gap-2">
+                <button onclick="closeDocLinkModal()" class="px-4 py-2 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg transition">Batal</button>
+                <button id="docLinkSaveBtn" onclick="saveDocLink()" class="px-4 py-2 text-xs font-semibold text-white bg-blue-500 hover:bg-blue-600 rounded-lg transition">Simpan</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Drive Links Modal -->
 <div id="driveLinksModal" class="fixed inset-0 z-[9999] hidden">
     <div class="absolute inset-0 bg-black/50" onclick="closeDriveLinksModal()"></div>
@@ -2304,79 +1869,34 @@ document.addEventListener('DOMContentLoaded', function() {
 </div>
 
 <script>
-var LINKS = {
-    proposal: <?= json_encode($driveLinks) ?>,
-    project_order: <?= json_encode($orderLinks) ?>
-};
+var DRIVE_LINKS = <?= json_encode($driveLinks) ?>;
 var DRIVE_VIEW_MODE = false;
-var DRIVE_LINK_TYPE = 'proposal';
 
-// Pasang/tampilkan centang milestone Project Analyze di stepper setelah link disimpan.
-// Aturan: kedua dokumen centang -> centang; salah satu silang -> silang.
-function refreshAnalyzeMilestone() {
-    var btn = document.querySelector('.ms-step[data-ms="1"]');
-    if (!btn) return;
-    var green = driveLinksFor('proposal').length > 0 && driveLinksFor('project_order').length > 0;
-    ['bg-emerald-50', 'text-emerald-700', 'border-emerald-200', 'bg-red-50', 'text-red-700', 'border-red-200', 'bg-slate-50', 'text-slate-400', 'border-slate-200', 'hover:bg-slate-100', 'bg-blue-50', 'text-blue-700', 'border-blue-300'].forEach(function(c) {
-        btn.classList.remove(c);
-    });
-    btn.classList.add('border');
-    var icon;
-    if (green) {
-        btn.classList.add('bg-emerald-50', 'text-emerald-700', 'border-emerald-200');
-        icon = '<i class="bi bi-check-circle-fill text-emerald-500"></i>';
-    } else {
-        btn.classList.add('bg-red-50', 'text-red-700', 'border-red-200');
-        icon = '<i class="bi bi-x-circle-fill text-red-500"></i>';
-    }
-    btn.innerHTML = icon + ' ' + (btn.getAttribute('data-ms-label') || 'Project Analyze');
-}
-
-var DRIVE_TYPE_META = {
-    proposal: {
-        defaultLabel: 'Short Proposal',
-        placeholderLabel: 'Label (opsional, misal: Short Proposal v2)',
-        editTitle: 'Update Short Proposal Link',
-        viewTitle: 'Download Short Proposal',
-        emptyMessage: 'Link short proposal belum diisi. Silakan isi lewat tombol Update.',
-        statusField: 'short_proposal_link'
-    },
-    project_order: {
-        defaultLabel: 'Project Order Document',
-        placeholderLabel: 'Label (opsional, misal: Project Order Rev 1)',
-        editTitle: 'Update Project Order Document Link',
-        viewTitle: 'Download Project Order Document',
-        emptyMessage: 'Link project order document belum diisi. Silakan isi lewat tombol Update.',
-        statusField: 'project_order_link'
-    }
+var DOC_LINKS = {
+    project_order_link: <?= json_encode($projectOrderLink) ?>
 };
-
-function driveLinksFor(type) {
-    return LINKS[type] || [];
-}
+var DOC_LINK_FIELD = '';
 
 function openProposalLinkModal() {
-    openDriveLinksModal(false, 'proposal');
-}
-
-function openOrderLinkModal() {
-    openDriveLinksModal(false, 'project_order');
+    openDriveLinksModal(false);
+    document.getElementById('driveModalTitle').textContent = 'Update Short Proposal Link';
 }
 
 function downloadProposalDocuments() {
-    if (driveLinksFor('proposal').length === 0) {
-        alert(DRIVE_TYPE_META.proposal.emptyMessage);
+    if (!DRIVE_LINKS || DRIVE_LINKS.length === 0) {
+        alert('Link short proposal belum diisi. Silakan isi lewat tombol Update.');
         return;
     }
-    openDriveLinksModal(true, 'proposal');
+    openDriveLinksModal(true);
 }
 
 function downloadProjectOrderDocument() {
-    if (driveLinksFor('project_order').length === 0) {
-        alert(DRIVE_TYPE_META.project_order.emptyMessage);
+    var link = DOC_LINKS.project_order_link || '';
+    if (!link) {
+        alert('Link project order document belum diisi. Silakan isi lewat tombol Update.');
         return;
     }
-    openDriveLinksModal(true, 'project_order');
+    window.open(link, '_blank', 'noopener');
 }
 
 function focusEditField(name) {
@@ -2407,26 +1927,72 @@ function downloadProjectPhoto() {
     }
 }
 
+function openDocLinkModal(field, label) {
+    DOC_LINK_FIELD = field;
+    document.getElementById('docLinkModalTitle').textContent = 'Update ' + label;
+    document.getElementById('docLinkInput').value = DOC_LINKS[field] || '';
+    document.getElementById('docLinkModal').classList.remove('hidden');
+    setTimeout(function() { document.getElementById('docLinkInput').focus(); }, 100);
+}
+
+function closeDocLinkModal() {
+    document.getElementById('docLinkModal').classList.add('hidden');
+    DOC_LINK_FIELD = '';
+}
+
 function docStatusHtml(filled) {
     return filled
         ? '<span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-emerald-100 text-emerald-600" title="Link sudah diisi"><i class="bi bi-check-lg"></i></span>'
         : '<span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-red-100 text-red-500" title="Link belum diisi"><i class="bi bi-x-lg"></i></span>';
 }
 
-function renderDocStatus(type, filled) {
-    var meta = DRIVE_TYPE_META[type];
-    if (!meta) return;
-    var el = document.getElementById('docStatus-' + meta.statusField);
+function renderDocStatus(field, filled) {
+    var el = document.getElementById('docStatus-' + field);
     if (!el) return;
-    if (typeof filled === 'undefined') filled = driveLinksFor(type).length > 0;
+    if (typeof filled === 'undefined') filled = !!DOC_LINKS[field];
     el.innerHTML = docStatusHtml(!!filled);
 }
 
-function openDriveLinksModal(viewMode, type) {
+function saveDocLink() {
+    var field = DOC_LINK_FIELD;
+    if (!field) return;
+    var value = document.getElementById('docLinkInput').value.trim();
+    if (value && !/^https?:\/\/\S+/i.test(value)) {
+        alert('Link harus diawali http:// atau https://');
+        return;
+    }
+    var btn = document.getElementById('docLinkSaveBtn');
+    var origText = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="bi bi-hourglass-split mr-1"></i>Saving...';
+
+    var fd = new FormData();
+    fd.append('id', '<?= (int)$id ?>');
+    fd.append('field', field);
+    fd.append('value', value);
+    fetch('api/update_doc_link.php', { method: 'POST', body: fd })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            btn.disabled = false;
+            btn.innerHTML = origText;
+            if (d.ok) {
+                DOC_LINKS[field] = d.value || '';
+                renderDocStatus(field);
+                closeDocLinkModal();
+            } else {
+                alert(d.msg || 'Gagal menyimpan link');
+            }
+        })
+        .catch(function(err) {
+            btn.disabled = false;
+            btn.innerHTML = origText;
+            alert('Error: ' + err.message);
+        });
+}
+
+function openDriveLinksModal(viewMode) {
     DRIVE_VIEW_MODE = !!viewMode;
-    DRIVE_LINK_TYPE = (type === 'project_order') ? 'project_order' : 'proposal';
-    var meta = DRIVE_TYPE_META[DRIVE_LINK_TYPE];
-    document.getElementById('driveModalTitle').textContent = DRIVE_VIEW_MODE ? meta.viewTitle : meta.editTitle;
+    document.getElementById('driveModalTitle').textContent = viewMode ? 'Download Short Proposal' : 'Edit Link Google Drive';
     renderDriveLinksModal();
     document.getElementById('driveLinksModal').classList.remove('hidden');
 }
@@ -2437,16 +2003,14 @@ function closeDriveLinksModal() {
 
 function renderDriveLinksModal() {
     var body = document.getElementById('driveModalBody');
-    var meta = DRIVE_TYPE_META[DRIVE_LINK_TYPE];
-    var links = driveLinksFor(DRIVE_LINK_TYPE);
     if (DRIVE_VIEW_MODE) {
         var html = '';
-        if (links.length === 0) {
+        if (DRIVE_LINKS.length === 0) {
             html = '<div class="text-center py-8 text-slate-400 text-sm"><i class="bi bi-cloud-slash text-3xl mb-2 block"></i>Belum ada link Google Drive.</div>';
         } else {
             html = '<div class="space-y-2">';
-            links.forEach(function(link) {
-                var label = link.label || meta.defaultLabel;
+            DRIVE_LINKS.forEach(function(link) {
+                var label = link.label || 'Short Proposal';
                 html += '<a href="' + escapeHtml(link.drive_url) + '" target="_blank" class="flex items-center gap-3 p-3 rounded-xl border border-slate-200 hover:border-emerald-400 hover:bg-emerald-50 transition group">' +
                     '<div class="w-10 h-10 rounded-lg bg-emerald-100 flex items-center justify-center flex-shrink-0"><i class="bi bi-google text-emerald-600"></i></div>' +
                     '<div class="min-w-0 flex-1"><div class="text-xs font-bold text-slate-700 truncate">' + escapeHtml(label) + '</div><div class="text-[10px] text-slate-400 truncate">' + escapeHtml(link.drive_url) + '</div></div>' +
@@ -2458,11 +2022,11 @@ function renderDriveLinksModal() {
         body.innerHTML = html;
     } else {
         var html2 = '<div class="space-y-3" id="driveLinkRowsModal">';
-        var rows = links.length ? links : [{drive_url:'',label:''}];
+        var rows = DRIVE_LINKS.length ? DRIVE_LINKS : [{drive_url:'',label:''}];
         rows.forEach(function(link, i) {
             html2 += '<div class="flex items-start gap-2 drive-row">' +
                 '<div class="flex-1 space-y-1">' +
-                '<input type="text" class="drive-label w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 focus:border-blue-400 focus:ring-1 focus:ring-blue-100 outline-none transition" placeholder="' + escapeHtml(meta.placeholderLabel) + '" value="' + escapeHtml(link.label || '') + '">' +
+                '<input type="text" class="drive-label w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 focus:border-blue-400 focus:ring-1 focus:ring-blue-100 outline-none transition" placeholder="Label (opsional, misal: Short Proposal v2)" value="' + escapeHtml(link.label || '') + '">' +
                 '<input type="url" class="drive-url w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 focus:border-blue-400 focus:ring-1 focus:ring-blue-100 outline-none transition" placeholder="https://drive.google.com/..." value="' + escapeHtml(link.drive_url || '') + '">' +
                 '</div>' +
                 '<button onclick="removeDriveRow(this)" class="mt-1 w-8 h-8 flex items-center justify-center rounded-lg bg-red-50 text-red-500 hover:bg-red-100 transition flex-shrink-0" title="Hapus"><i class="bi bi-trash text-xs"></i></button>' +
